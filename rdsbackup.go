@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const version = "1.0"
+const version = "1.1"
 
 var usage = `rdsbackup: easy cross-region AWS RDS backups
 
@@ -41,6 +41,7 @@ type config struct {
 	dst       string
 	arn       string
 	copyId    string
+	awsAcctId string
 	awsKeyId  string
 	awsSecret string
 	debugOn   bool
@@ -52,23 +53,29 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	c.awsAcctId, err = c.findAcccountID()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err = c.findLatestSnap(); err != nil {
+		log.Fatal(err)
+	}
+	if c.checkSnapCopied() {
+		c.debug("Source snapshot has already been copied to destination region.")
+		os.Exit(0)
+	}
+	if err = c.copySnap(); err != nil {
+		log.Fatal(err)
+	}
+	if err = c.waitForCopy(); err != nil {
+		log.Fatal(err)
+	}
 	// TODO: cleanup old snapshots
-	err = c.findLatestSnap()
-	if err != nil {
-		log.Fatal(err)
-	}
-	err = c.copySnap()
-	if err != nil {
-		log.Fatal(err)
-	}
-	err = c.waitForCopy()
-	if err != nil {
-		log.Fatal(err)
-	}
 	c.debug("All done!")
+	os.Exit(0)
 }
 
-// parseArgs
+// parseArgs handles command line flags
 func parseArgs() (config, error) {
 	c := config{}
 	args, err := docopt.Parse(usage, nil, true, version, false)
@@ -96,7 +103,7 @@ func parseArgs() (config, error) {
 	return c, nil
 }
 
-// findAcccountID
+// findAcccountID returns the AWS account ID
 func (c *config) findAcccountID() (string, error) {
 	i := iam.New(c.creds, c.src, nil)
 	u, err := i.GetUser(nil)
@@ -110,14 +117,10 @@ func (c *config) findAcccountID() (string, error) {
 	return parts[4], nil
 }
 
-// findLatestSnap
+// findLatestSnap finds the source snapshot to copy
 func (c *config) findLatestSnap() error {
-	awsacctid, err := c.findAcccountID()
-	if err != nil {
-		return err
-	}
 	cli := rds.New(c.creds, c.src, nil)
-	c.debug(fmt.Sprintf("Searching for snapshots for: %s\n", c.dbid))
+	c.debug(fmt.Sprintf("Searching for snapshots for: %s", c.dbid))
 	q := rds.DescribeDBSnapshotsMessage{}
 	q.DBInstanceIdentifier = aws.String(c.dbid)
 	resp, err := cli.DescribeDBSnapshots(&q)
@@ -129,7 +132,7 @@ func (c *config) findLatestSnap() error {
 	if len(resp.DBSnapshots) < 1 {
 		return fmt.Errorf("No snapshots found")
 	}
-	c.debug(fmt.Sprintf("Found %d snapshots for: %s\n", len(resp.DBSnapshots), c.dbid))
+	c.debug(fmt.Sprintf("Found %d snapshots for: %s", len(resp.DBSnapshots), c.dbid))
 	for _, r := range resp.DBSnapshots {
 		if r.SnapshotCreateTime.After(newest) {
 			newestId = *r.DBSnapshotIdentifier
@@ -139,12 +142,43 @@ func (c *config) findLatestSnap() error {
 	if len(newestId) < 1 {
 		return fmt.Errorf("No usable snapshot found")
 	}
-	c.arn = fmt.Sprintf("arn:aws:rds:%s:%s:snapshot:%s", c.src, awsacctid, newestId)
-	c.debug(fmt.Sprintf("Copying latest snapshot: %s: %s \n", newestId, newest.String()))
+	c.arn = fmt.Sprintf("arn:aws:rds:%s:%s:snapshot:%s", c.src, c.awsAcctId, newestId)
+	c.debug(fmt.Sprintf("Copying latest snapshot: %s: %s", newestId, newest.String()))
 	return nil
 }
 
-// copySnap
+// checkSnapCopied returns true if the source snapshot has already been copied to the destination region
+func (c *config) checkSnapCopied() bool {
+	cli := rds.New(c.creds, c.dst, nil)
+	q := rds.DescribeDBSnapshotsMessage{}
+	q.DBInstanceIdentifier = aws.String(c.dbid)
+	resp, err := cli.DescribeDBSnapshots(&q)
+	if err != nil {
+		return false
+	}
+	for _, s := range resp.DBSnapshots {
+		q := rds.ListTagsForResourceMessage{ResourceName: aws.String(fmt.Sprintf("arn:aws:rds:%s:%s:snapshot:%s", c.dst, c.awsAcctId, *s.DBSnapshotIdentifier))}
+		tags, err := cli.ListTagsForResource(&q)
+		if err != nil {
+			continue
+		}
+		managedByUs := false
+		matchedSource := false
+		for _, t := range tags.TagList {
+			if *t.Key == "managedby" && *t.Value == "rdsbackup" {
+				managedByUs = true
+			} else if *t.Key == "sourcearn" && *t.Value == c.arn {
+				matchedSource = true
+			}
+		}
+		if managedByUs && matchedSource {
+			return true
+		}
+	}
+	return false
+}
+
+// copySnap starts the RDS snapshot copy
 func (c *config) copySnap() error {
 	cli := rds.New(c.creds, c.dst, nil)
 	t := time.Now()
@@ -156,6 +190,7 @@ func (c *config) copySnap() error {
 			rds.Tag{aws.String("timestamp"), aws.String(fmt.Sprintf("%d", t.Unix()))},
 			rds.Tag{aws.String("source"), aws.String(c.src)},
 			rds.Tag{aws.String("sourceid"), aws.String(c.dbid)},
+			rds.Tag{aws.String("sourcearn"), aws.String(c.arn)},
 			rds.Tag{aws.String("managedby"), aws.String("rdsbackup")},
 		},
 		TargetDBSnapshotIdentifier: aws.String(c.copyId),
@@ -169,9 +204,9 @@ func (c *config) copySnap() error {
 	return nil
 }
 
-// waitForCopy
+// waitForCopy waits for the RDS snapshot copy to finish
 func (c *config) waitForCopy() error {
-	c.debug(fmt.Sprintf("Waiting for copy %s...\n", c.copyId))
+	c.debug(fmt.Sprintf("Waiting for copy %s...", c.copyId))
 	cli := rds.New(c.creds, c.dst, nil)
 	q := rds.DescribeDBSnapshotsMessage{}
 	q.DBSnapshotIdentifier = aws.String(c.copyId)
@@ -188,12 +223,12 @@ func (c *config) waitForCopy() error {
 			break
 		}
 		c.debug(fmt.Sprintf("Waiting %s (%d%% complete)", *s.Status, *s.PercentProgress))
-		time.Sleep(10 * time.Second) // Run for some time to simulate work
+		time.Sleep(10 * time.Second)
 	}
 	return nil
 }
 
-// debug
+// debug prints debugging mesages if enabled
 func (c *config) debug(s string) {
 	if c.debugOn {
 		log.Println(s)
