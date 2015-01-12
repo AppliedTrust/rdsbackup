@@ -8,11 +8,13 @@ import (
 	"github.com/stripe/aws-go/gen/rds"
 	"log"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
-const version = "1.1"
+const version = "1.2"
 
 var usage = `rdsbackup: easy cross-region AWS RDS backups
 
@@ -30,9 +32,10 @@ Options:
   -d, --dest=<region>       AWS region to store backup RDS snapshot [default: us-west-1].
   -K, --awskey=<keyid>      AWS key ID (or use AWS_ACCESS_KEY_ID environemnt variable).
   -S, --awssecret=<secret>  AWS secret key (or use AWS_SECRET_ACCESS_KEY environemnt variable).
-  --debug                   Enable debugging output.
-  --version                 Show version.
+  -p, --purge=<count>       Purge oldest snapshots from dest region if more than <count> exist.
+  -q, --quiet               Silence all output except errors.
   -h, --help                Show this screen.
+  --version                 Show version.
 `
 
 type config struct {
@@ -44,7 +47,8 @@ type config struct {
 	awsAcctId string
 	awsKeyId  string
 	awsSecret string
-	debugOn   bool
+	purge     int
+	quiet     bool
 	creds     aws.CredentialsProvider
 }
 
@@ -70,7 +74,9 @@ func main() {
 	if err = c.waitForCopy(); err != nil {
 		log.Fatal(err)
 	}
-	// TODO: cleanup old snapshots
+	if err = c.cleanupSnaps(); err != nil {
+		log.Fatal(err)
+	}
 	c.debug("All done!")
 	os.Exit(0)
 }
@@ -82,10 +88,18 @@ func parseArgs() (config, error) {
 	if err != nil {
 		return c, err
 	}
+	if purge, ok := args["--purge"].(string); ok {
+		c.purge, err = strconv.Atoi(purge)
+		if err != nil {
+			return c, err
+		}
+	} else {
+		c.purge = 0
+	}
 	c.dbid = args["<db_instance_id>"].(string)
 	c.src = args["--source"].(string)
 	c.dst = args["--dest"].(string)
-	c.debugOn = args["--debug"].(bool)
+	c.quiet = args["--quiet"].(bool)
 	if arg, ok := args["--awskey"].(string); ok {
 		c.awsKeyId = arg
 	} else {
@@ -143,7 +157,7 @@ func (c *config) findLatestSnap() error {
 		return fmt.Errorf("No usable snapshot found")
 	}
 	c.arn = fmt.Sprintf("arn:aws:rds:%s:%s:snapshot:%s", c.src, c.awsAcctId, newestId)
-	c.debug(fmt.Sprintf("Copying latest snapshot: %s: %s", newestId, newest.String()))
+	c.debug(fmt.Sprintf("Found latest snapshot: %s: %s", newestId, newest.String()))
 	return nil
 }
 
@@ -228,9 +242,67 @@ func (c *config) waitForCopy() error {
 	return nil
 }
 
+// cleanupSnaps
+func (c *config) cleanupSnaps() error {
+	if c.purge <= 0 {
+		return nil
+	}
+	c.debug(fmt.Sprintf("Cleaning up old snapshots in dest region %s...", c.dst))
+	cli := rds.New(c.creds, c.dst, nil)
+	q := rds.DescribeDBSnapshotsMessage{}
+	q.DBInstanceIdentifier = aws.String(c.dbid)
+	resp, err := cli.DescribeDBSnapshots(&q)
+	if err != nil {
+		return err
+	}
+	snaps := map[int64]string{}
+	keys := int64arr{}
+	for _, s := range resp.DBSnapshots {
+		q := rds.ListTagsForResourceMessage{ResourceName: aws.String(fmt.Sprintf("arn:aws:rds:%s:%s:snapshot:%s", c.dst, c.awsAcctId, *s.DBSnapshotIdentifier))}
+		tags, err := cli.ListTagsForResource(&q)
+		if err != nil {
+			continue
+		}
+		for _, t := range tags.TagList {
+			if *t.Key == "managedby" && *t.Value == "rdsbackup" {
+				if s.SnapshotCreateTime.Unix() > 0 {
+					snaps[s.SnapshotCreateTime.Unix()] = *s.DBSnapshotIdentifier
+					keys = append(keys, s.SnapshotCreateTime.Unix())
+				}
+			}
+		}
+	}
+	if len(snaps) <= c.purge {
+		c.debug(fmt.Sprintf("Found %d snapshots. Purge flag is %d, so nothing will be purged.", len(snaps), c.purge))
+	} else {
+		c.debug(fmt.Sprintf("Found %d snapshots. Purge flag is %d, so the oldest %d snapshots will be purged.", len(snaps), c.purge, len(snaps)-c.purge))
+		sort.Sort(keys)
+		for i := 0; i < len(snaps)-c.purge; i++ {
+			c.debug(fmt.Sprintf("Purging snapshot %s.", snaps[keys[i]]))
+			q := rds.DeleteDBSnapshotMessage{DBSnapshotIdentifier: aws.String(snaps[keys[i]])}
+			resp, err := cli.DeleteDBSnapshot(&q)
+			if err != nil {
+				return err
+			}
+			if *resp.DBSnapshot.Status != "deleted" {
+				c.debug(fmt.Sprintf("Warning: snapshot was not deleted successfully: %s", snaps[keys[i]]))
+			}
+		}
+		c.debug("Done purging shapshots.")
+	}
+	return nil
+}
+
 // debug prints debugging mesages if enabled
 func (c *config) debug(s string) {
-	if c.debugOn {
+	if !c.quiet {
 		log.Println(s)
 	}
 }
+
+// int64arr supports sorting by unix timestamp
+type int64arr []int64
+
+func (a int64arr) Len() int           { return len(a) }
+func (a int64arr) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a int64arr) Less(i, j int) bool { return a[i] < a[j] }
