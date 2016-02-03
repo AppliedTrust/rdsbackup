@@ -17,8 +17,6 @@ AWS Authentication:
 Options:
   -s, --source=<region>     AWS region of source RDS instance [default: us-east-1].
   -d, --dest=<region>       AWS region to store backup RDS snapshot [default: us-west-1].
-  -K, --awskey=<keyid>      AWS key ID (or use AWS_ACCESS_KEY_ID environemnt variable).
-  -S, --awssecret=<secret>  AWS secret key (or use AWS_SECRET_ACCESS_KEY environemnt variable).
   -p, --purge=<count>       Purge oldest snapshots from dest region if more than <count> exist.
   -q, --quiet               Silence all output except errors.
   -h, --help                Show this screen.
@@ -39,3 +37,5 @@ sourcearn | ``<SourceDBARN>``
 time | ``<2006-01-02 15:04:05 -0700>``
 timestamp | ``<SecondsSinceEpoch>``
 
+####Configuring AWS credentials:
+See the README for the AWS SDK for more details: https://github.com/aws/aws-sdk-go#configuring-credentials
