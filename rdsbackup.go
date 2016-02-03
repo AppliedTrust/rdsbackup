@@ -59,6 +59,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	if err = c.cleanupSnaps(); err != nil {
+		log.Fatal(err)
+	}
 	if err = c.findLatestSnap(); err != nil {
 		log.Fatal(err)
 	}
@@ -70,9 +73,6 @@ func main() {
 		log.Fatal(err)
 	}
 	if err = c.waitForCopy(); err != nil {
-		log.Fatal(err)
-	}
-	if err = c.cleanupSnaps(); err != nil {
 		log.Fatal(err)
 	}
 	c.debug("All done!")
@@ -113,6 +113,57 @@ func (c *config) findAcccountID() (string, error) {
 		return "", fmt.Errorf("Error parsing user ARN")
 	}
 	return parts[4], nil
+}
+
+// cleanupSnaps
+func (c *config) cleanupSnaps() error {
+	if c.purge <= 0 {
+		return nil
+	}
+	c.debug(fmt.Sprintf("Cleaning up old snapshots in dest region %s...", c.dst))
+	cli := rds.New(session.New(), &aws.Config{Region: aws.String(c.dst)})
+	q := rds.DescribeDBSnapshotsInput{}
+	q.DBInstanceIdentifier = aws.String(c.dbid)
+	resp, err := cli.DescribeDBSnapshots(&q)
+	if err != nil {
+		return err
+	}
+	snaps := map[int64]string{}
+	keys := int64arr{}
+	for _, s := range resp.DBSnapshots {
+		q := rds.ListTagsForResourceInput{ResourceName: aws.String(fmt.Sprintf("arn:aws:rds:%s:%s:snapshot:%s", c.dst, c.awsAcctId, *s.DBSnapshotIdentifier))}
+		tags, err := cli.ListTagsForResource(&q)
+		if err != nil {
+			continue
+		}
+		for _, t := range tags.TagList {
+			if *t.Key == "managedby" && *t.Value == "rdsbackup" {
+				if s.SnapshotCreateTime.Unix() > 0 {
+					snaps[s.SnapshotCreateTime.Unix()] = *s.DBSnapshotIdentifier
+					keys = append(keys, s.SnapshotCreateTime.Unix())
+				}
+			}
+		}
+	}
+	if len(snaps) <= c.purge {
+		c.debug(fmt.Sprintf("Found %d snapshots. Purge flag is %d, so nothing will be purged.", len(snaps), c.purge))
+	} else {
+		c.debug(fmt.Sprintf("Found %d snapshots. Purge flag is %d, so the oldest %d snapshots will be purged.", len(snaps), c.purge, len(snaps)-c.purge))
+		sort.Sort(keys)
+		for i := 0; i < len(snaps)-c.purge; i++ {
+			c.debug(fmt.Sprintf("Purging snapshot %s.", snaps[keys[i]]))
+			q := rds.DeleteDBSnapshotInput{DBSnapshotIdentifier: aws.String(snaps[keys[i]])}
+			resp, err := cli.DeleteDBSnapshot(&q)
+			if err != nil {
+				return err
+			}
+			if *resp.DBSnapshot.Status != "deleted" {
+				c.debug(fmt.Sprintf("Warning: snapshot was not deleted successfully: %s", snaps[keys[i]]))
+			}
+		}
+		c.debug("Done purging shapshots.")
+	}
+	return nil
 }
 
 // findLatestSnap finds the source snapshot to copy
@@ -196,7 +247,7 @@ func (c *config) copySnap() error {
 	resp, err := cli.CopyDBSnapshot(&m)
 	if err != nil {
 		return err
-	} else if *resp.DBSnapshot.Status != "creating" {
+	} else if *resp.DBSnapshot.Status != "creating" || *resp.DBSnapshot.Status != "pending" {
 		return fmt.Errorf("Error creating snapshot - unexpected status: %s", *resp.DBSnapshot.Status)
 	}
 	return nil
@@ -222,57 +273,6 @@ func (c *config) waitForCopy() error {
 		}
 		c.debug(fmt.Sprintf("Waiting %s (%d%% complete)", *s.Status, *s.PercentProgress))
 		time.Sleep(10 * time.Second)
-	}
-	return nil
-}
-
-// cleanupSnaps
-func (c *config) cleanupSnaps() error {
-	if c.purge <= 0 {
-		return nil
-	}
-	c.debug(fmt.Sprintf("Cleaning up old snapshots in dest region %s...", c.dst))
-	cli := rds.New(session.New(), &aws.Config{Region: aws.String(c.dst)})
-	q := rds.DescribeDBSnapshotsInput{}
-	q.DBInstanceIdentifier = aws.String(c.dbid)
-	resp, err := cli.DescribeDBSnapshots(&q)
-	if err != nil {
-		return err
-	}
-	snaps := map[int64]string{}
-	keys := int64arr{}
-	for _, s := range resp.DBSnapshots {
-		q := rds.ListTagsForResourceInput{ResourceName: aws.String(fmt.Sprintf("arn:aws:rds:%s:%s:snapshot:%s", c.dst, c.awsAcctId, *s.DBSnapshotIdentifier))}
-		tags, err := cli.ListTagsForResource(&q)
-		if err != nil {
-			continue
-		}
-		for _, t := range tags.TagList {
-			if *t.Key == "managedby" && *t.Value == "rdsbackup" {
-				if s.SnapshotCreateTime.Unix() > 0 {
-					snaps[s.SnapshotCreateTime.Unix()] = *s.DBSnapshotIdentifier
-					keys = append(keys, s.SnapshotCreateTime.Unix())
-				}
-			}
-		}
-	}
-	if len(snaps) <= c.purge {
-		c.debug(fmt.Sprintf("Found %d snapshots. Purge flag is %d, so nothing will be purged.", len(snaps), c.purge))
-	} else {
-		c.debug(fmt.Sprintf("Found %d snapshots. Purge flag is %d, so the oldest %d snapshots will be purged.", len(snaps), c.purge, len(snaps)-c.purge))
-		sort.Sort(keys)
-		for i := 0; i < len(snaps)-c.purge; i++ {
-			c.debug(fmt.Sprintf("Purging snapshot %s.", snaps[keys[i]]))
-			q := rds.DeleteDBSnapshotInput{DBSnapshotIdentifier: aws.String(snaps[keys[i]])}
-			resp, err := cli.DeleteDBSnapshot(&q)
-			if err != nil {
-				return err
-			}
-			if *resp.DBSnapshot.Status != "deleted" {
-				c.debug(fmt.Sprintf("Warning: snapshot was not deleted successfully: %s", snaps[keys[i]]))
-			}
-		}
-		c.debug("Done purging shapshots.")
 	}
 	return nil
 }
