@@ -2,10 +2,11 @@ package main
 
 import (
 	"fmt"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/iam"
+	"github.com/aws/aws-sdk-go/service/rds"
 	"github.com/docopt/docopt-go"
-	"github.com/stripe/aws-go/aws"
-	"github.com/stripe/aws-go/gen/iam"
-	"github.com/stripe/aws-go/gen/rds"
 	"log"
 	"os"
 	"sort"
@@ -45,11 +46,8 @@ type config struct {
 	arn       string
 	copyId    string
 	awsAcctId string
-	awsKeyId  string
-	awsSecret string
 	purge     int
 	quiet     bool
-	creds     aws.CredentialsProvider
 }
 
 func main() {
@@ -100,31 +98,17 @@ func parseArgs() (config, error) {
 	c.src = args["--source"].(string)
 	c.dst = args["--dest"].(string)
 	c.quiet = args["--quiet"].(bool)
-	if arg, ok := args["--awskey"].(string); ok {
-		c.awsKeyId = arg
-	} else {
-		c.awsKeyId = os.Getenv("AWS_ACCESS_KEY_ID")
-	}
-	if arg, ok := args["--awssecret"].(string); ok {
-		c.awsSecret = arg
-	} else {
-		c.awsSecret = os.Getenv("AWS_SECRET_ACCESS_KEY")
-	}
-	if len(c.awsKeyId) < 1 || len(c.awsSecret) < 1 {
-		return c, fmt.Errorf("Must use -K and -S options or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables.")
-	}
-	c.creds = aws.Creds(c.awsKeyId, c.awsSecret, "")
 	return c, nil
 }
 
 // findAcccountID returns the AWS account ID
 func (c *config) findAcccountID() (string, error) {
-	i := iam.New(c.creds, c.src, nil)
+	i := iam.New(session.New(), &aws.Config{Region: aws.String(c.src)})
 	u, err := i.GetUser(nil)
 	if err != nil {
 		return "", err
 	}
-	parts := strings.Split(*u.User.ARN, ":")
+	parts := strings.Split(*u.User.Arn, ":")
 	if len(parts) != 6 {
 		return "", fmt.Errorf("Error parsing user ARN")
 	}
@@ -133,9 +117,9 @@ func (c *config) findAcccountID() (string, error) {
 
 // findLatestSnap finds the source snapshot to copy
 func (c *config) findLatestSnap() error {
-	cli := rds.New(c.creds, c.src, nil)
+	cli := rds.New(session.New(), &aws.Config{Region: aws.String(c.src)})
 	c.debug(fmt.Sprintf("Searching for snapshots for: %s", c.dbid))
-	q := rds.DescribeDBSnapshotsMessage{}
+	q := rds.DescribeDBSnapshotsInput{}
 	q.DBInstanceIdentifier = aws.String(c.dbid)
 	resp, err := cli.DescribeDBSnapshots(&q)
 	if err != nil {
@@ -150,7 +134,7 @@ func (c *config) findLatestSnap() error {
 	for _, r := range resp.DBSnapshots {
 		if r.SnapshotCreateTime.After(newest) {
 			newestId = *r.DBSnapshotIdentifier
-			newest = r.SnapshotCreateTime
+			newest = *r.SnapshotCreateTime
 		}
 	}
 	if len(newestId) < 1 {
@@ -163,15 +147,15 @@ func (c *config) findLatestSnap() error {
 
 // checkSnapCopied returns true if the source snapshot has already been copied to the destination region
 func (c *config) checkSnapCopied() bool {
-	cli := rds.New(c.creds, c.dst, nil)
-	q := rds.DescribeDBSnapshotsMessage{}
+	cli := rds.New(session.New(), &aws.Config{Region: aws.String(c.dst)})
+	q := rds.DescribeDBSnapshotsInput{}
 	q.DBInstanceIdentifier = aws.String(c.dbid)
 	resp, err := cli.DescribeDBSnapshots(&q)
 	if err != nil {
 		return false
 	}
 	for _, s := range resp.DBSnapshots {
-		q := rds.ListTagsForResourceMessage{ResourceName: aws.String(fmt.Sprintf("arn:aws:rds:%s:%s:snapshot:%s", c.dst, c.awsAcctId, *s.DBSnapshotIdentifier))}
+		q := rds.ListTagsForResourceInput{ResourceName: aws.String(fmt.Sprintf("arn:aws:rds:%s:%s:snapshot:%s", c.dst, c.awsAcctId, *s.DBSnapshotIdentifier))}
 		tags, err := cli.ListTagsForResource(&q)
 		if err != nil {
 			continue
@@ -194,18 +178,18 @@ func (c *config) checkSnapCopied() bool {
 
 // copySnap starts the RDS snapshot copy
 func (c *config) copySnap() error {
-	cli := rds.New(c.creds, c.dst, nil)
+	cli := rds.New(session.New(), &aws.Config{Region: aws.String(c.dst)})
 	t := time.Now()
 	c.copyId = fmt.Sprintf("%s-%s", c.dbid, t.Format("2006-01-02at15-04MST"))
-	m := rds.CopyDBSnapshotMessage{
+	m := rds.CopyDBSnapshotInput{
 		SourceDBSnapshotIdentifier: aws.String(c.arn),
-		Tags: []rds.Tag{
-			rds.Tag{aws.String("time"), aws.String(t.Format("2006-01-02 15:04:05 -0700"))},
-			rds.Tag{aws.String("timestamp"), aws.String(fmt.Sprintf("%d", t.Unix()))},
-			rds.Tag{aws.String("source"), aws.String(c.src)},
-			rds.Tag{aws.String("sourceid"), aws.String(c.dbid)},
-			rds.Tag{aws.String("sourcearn"), aws.String(c.arn)},
-			rds.Tag{aws.String("managedby"), aws.String("rdsbackup")},
+		Tags: []*rds.Tag{
+			&rds.Tag{Key: aws.String("time"), Value: aws.String(t.Format("2006-01-02 15:04:05 -0700"))},
+			&rds.Tag{Key: aws.String("timestamp"), Value: aws.String(fmt.Sprintf("%d", t.Unix()))},
+			&rds.Tag{Key: aws.String("source"), Value: aws.String(c.src)},
+			&rds.Tag{Key: aws.String("sourceid"), Value: aws.String(c.dbid)},
+			&rds.Tag{Key: aws.String("sourcearn"), Value: aws.String(c.arn)},
+			&rds.Tag{Key: aws.String("managedby"), Value: aws.String("rdsbackup")},
 		},
 		TargetDBSnapshotIdentifier: aws.String(c.copyId),
 	}
@@ -221,8 +205,8 @@ func (c *config) copySnap() error {
 // waitForCopy waits for the RDS snapshot copy to finish
 func (c *config) waitForCopy() error {
 	c.debug(fmt.Sprintf("Waiting for copy %s...", c.copyId))
-	cli := rds.New(c.creds, c.dst, nil)
-	q := rds.DescribeDBSnapshotsMessage{}
+	cli := rds.New(session.New(), &aws.Config{Region: aws.String(c.dst)})
+	q := rds.DescribeDBSnapshotsInput{}
 	q.DBSnapshotIdentifier = aws.String(c.copyId)
 	for {
 		resp, err := cli.DescribeDBSnapshots(&q)
@@ -248,8 +232,8 @@ func (c *config) cleanupSnaps() error {
 		return nil
 	}
 	c.debug(fmt.Sprintf("Cleaning up old snapshots in dest region %s...", c.dst))
-	cli := rds.New(c.creds, c.dst, nil)
-	q := rds.DescribeDBSnapshotsMessage{}
+	cli := rds.New(session.New(), &aws.Config{Region: aws.String(c.dst)})
+	q := rds.DescribeDBSnapshotsInput{}
 	q.DBInstanceIdentifier = aws.String(c.dbid)
 	resp, err := cli.DescribeDBSnapshots(&q)
 	if err != nil {
@@ -258,7 +242,7 @@ func (c *config) cleanupSnaps() error {
 	snaps := map[int64]string{}
 	keys := int64arr{}
 	for _, s := range resp.DBSnapshots {
-		q := rds.ListTagsForResourceMessage{ResourceName: aws.String(fmt.Sprintf("arn:aws:rds:%s:%s:snapshot:%s", c.dst, c.awsAcctId, *s.DBSnapshotIdentifier))}
+		q := rds.ListTagsForResourceInput{ResourceName: aws.String(fmt.Sprintf("arn:aws:rds:%s:%s:snapshot:%s", c.dst, c.awsAcctId, *s.DBSnapshotIdentifier))}
 		tags, err := cli.ListTagsForResource(&q)
 		if err != nil {
 			continue
@@ -279,7 +263,7 @@ func (c *config) cleanupSnaps() error {
 		sort.Sort(keys)
 		for i := 0; i < len(snaps)-c.purge; i++ {
 			c.debug(fmt.Sprintf("Purging snapshot %s.", snaps[keys[i]]))
-			q := rds.DeleteDBSnapshotMessage{DBSnapshotIdentifier: aws.String(snaps[keys[i]])}
+			q := rds.DeleteDBSnapshotInput{DBSnapshotIdentifier: aws.String(snaps[keys[i]])}
 			resp, err := cli.DeleteDBSnapshot(&q)
 			if err != nil {
 				return err
